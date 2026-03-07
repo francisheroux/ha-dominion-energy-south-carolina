@@ -1,0 +1,11 @@
+{
+  "domain": "dominion_energy_sc",
+  "name": "Dominion Energy South Carolina",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "",
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "version": "1.0.0"
+}

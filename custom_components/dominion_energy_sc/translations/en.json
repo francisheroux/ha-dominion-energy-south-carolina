@@ -1,0 +1,39 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Dominion Energy South Carolina",
+        "description": "Enter your Dominion Energy SC account credentials.",
+        "data": {
+          "username": "Email address",
+          "password": "Password"
+        }
+      },
+      "select_account": {
+        "title": "Select Account",
+        "description": "Multiple accounts were found. Select the account to add.",
+        "data": {
+          "account": "Account"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Dominion Energy SC",
+        "description": "Your session has expired. Please enter your credentials again.",
+        "data": {
+          "username": "Email address",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_credentials": "Invalid email address or password.",
+      "cannot_connect": "Cannot connect to Dominion Energy SC. Check your internet connection.",
+      "unknown": "An unexpected error occurred.",
+      "no_accounts": "No accounts were found for this login."
+    },
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Re-authentication was successful."
+    }
+  }
+}
