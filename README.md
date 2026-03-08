@@ -31,7 +31,7 @@ This was created because the Dominion Energy South Carolina uses completely diff
 
 ### Setup Flow
 
-- Enter your Dominion Energy SC email address and password
+- Enter your Dominion Energy SC username and password
 - The integration will automatically discover all accounts associated with your login
 - If multiple accounts are found, you will be prompted to select one
 - Each account creates its own device in Home Assistant with associated sensors
