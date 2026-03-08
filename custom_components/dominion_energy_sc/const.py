@@ -6,6 +6,7 @@ BASE_URL = "https://account.dominionenergysc.com"
 SCAN_INTERVAL = timedelta(hours=12)
 
 # Auth endpoints (JSON REST API)
+ENDPOINT_ACCESS = "/access/"
 ENDPOINT_AUTH = "/fusionapi/LoginWebApi/Authenticate/"
 ENDPOINT_INIT_AUTH = "/fusionapi/LoginWebApi/InitAuthentication/"
 ENDPOINT_SEND_PIN = "/fusionapi/LoginWebApi/SendPINCode/"

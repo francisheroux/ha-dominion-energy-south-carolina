@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import aiohttp
 
 from .const import (
     BASE_URL,
+    ENDPOINT_ACCESS,
     ENDPOINT_ACCOUNT_INIT,
     ENDPOINT_AUTH,
     ENDPOINT_DAILY,
@@ -67,6 +69,28 @@ class DominionEnergySCClient:
             "Referer": BASE_URL + "/",
         }
 
+    async def async_setup_session(self) -> None:
+        """GET the login page to establish session cookies and extract the CSRF token."""
+        try:
+            async with self._session.get(
+                BASE_URL + ENDPOINT_ACCESS,
+                allow_redirects=True,
+            ) as resp:
+                html = await resp.text()
+        except aiohttp.ClientError as err:
+            raise CannotConnectError(str(err)) from err
+
+        match = re.search(
+            r'name="__RequestVerificationToken"[^>]*value="([^"]+)"'
+            r'|value="([^"]+)"[^>]*name="__RequestVerificationToken"',
+            html,
+        )
+        if match:
+            self._api_csrf_token = match.group(1) or match.group(2)
+            _LOGGER.debug("CSRF token extracted from login page")
+        else:
+            _LOGGER.warning("Could not extract __RequestVerificationToken from /access/")
+
     async def async_login(self, username: str, password: str) -> None:
         """Authenticate via JSON REST API.
 
@@ -74,13 +98,17 @@ class DominionEnergySCClient:
         Raises InvalidCredentialsError on bad credentials.
         Sets self._api_csrf_token on success.
         """
+        await self.async_setup_session()
+
         try:
             async with self._session.post(
                 BASE_URL + ENDPOINT_AUTH,
                 json={"userName": username, "password": password, "_df": ""},
                 headers={
-                    "Accept": "application/json",
+                    "__requestverificationtoken": self._api_csrf_token or "",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
                     "Content-Type": "application/json",
+                    "isajax": "true",
                     "X-Requested-With": "XMLHttpRequest",
                 },
                 allow_redirects=True,
@@ -89,8 +117,18 @@ class DominionEnergySCClient:
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
 
-        _LOGGER.warning("Authenticate response (all keys): %s", list(payload.keys()))
-        _LOGGER.warning("Authenticate response (full): %s", payload)
+        _LOGGER.info("Authenticate response: %s", payload)
+
+        # Detect ASP.NET exception response format {errorNumber, message, detail}
+        if "detail" in payload and "Exception" in str(payload.get("detail", "")):
+            raise CannotConnectError(
+                f"Server error during authentication: {payload.get('message', 'Unknown error')}"
+            )
+        error_number = payload.get("errorNumber")
+        if error_number is not None and int(error_number) != 0:
+            raise CannotConnectError(
+                f"Server returned errorNumber={error_number}: {payload.get('message')}"
+            )
 
         has_return_code = "returnCode" in payload
         return_code = str(payload.get("returnCode", "-1"))
@@ -213,12 +251,14 @@ class DominionEnergySCClient:
         await self.async_get_aft()
 
     async def async_get_aft(self) -> None:
-        """Retrieve the anti-forgery token and store it for API calls."""
+        """Call GetAFT for protocol compliance (token comes from /access/ page, not here)."""
         try:
             async with self._session.get(
                 BASE_URL + ENDPOINT_GET_AFT,
                 headers={
+                    "__requestverificationtoken": self._api_csrf_token or "",
                     "Accept": "application/json",
+                    "isajax": "true",
                     "X-Requested-With": "XMLHttpRequest",
                 },
                 allow_redirects=True,
@@ -226,28 +266,7 @@ class DominionEnergySCClient:
                 payload = await resp.json(content_type=None)
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
-
         _LOGGER.debug("GetAFT response: %s", payload)
-
-        # Token may be at top-level "data", nested, or a bare string
-        data = payload.get("data", payload)
-        if isinstance(data, str):
-            self._api_csrf_token = data
-        elif isinstance(data, dict):
-            for key in ("token", "aft", "antiForgerToken", "__RequestVerificationToken"):
-                if key in data:
-                    self._api_csrf_token = data[key]
-                    break
-            else:
-                # Last resort: use the first string value found
-                for v in data.values():
-                    if isinstance(v, str) and v:
-                        self._api_csrf_token = v
-                        break
-        else:
-            _LOGGER.warning("Unexpected GetAFT payload shape: %s", payload)
-
-        _LOGGER.debug("AFT token set: %s", bool(self._api_csrf_token))
 
     def _check_session_expired(self, resp: aiohttp.ClientResponse) -> None:
         """Raise SessionExpiredError if response indicates session loss."""
