@@ -53,10 +53,10 @@ This was created because the Dominion Energy South Carolina uses completely diff
 
 Electric sensors only appear for electric and dual-service accounts. Gas sensors only appear for gas and dual-service accounts.
 
-## Limitations
+## Limitations of the API
 
 - Data updates every 12 hours — near-real-time monitoring is not supported
-- Daily granularity only (no 30-minute interval data)
+- Daily granularity only
 - Daily usage detail requires a smart meter (AMI meter) on the account
 
 ## Support

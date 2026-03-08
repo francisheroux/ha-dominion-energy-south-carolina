@@ -1,23 +1,28 @@
 """Dominion Energy South Carolina API client."""
 from __future__ import annotations
 
-import re
+import logging
 from typing import Any
 
 import aiohttp
 
 from .const import (
     BASE_URL,
+    ENDPOINT_ACCOUNT_INIT,
+    ENDPOINT_AUTH,
     ENDPOINT_DAILY,
     ENDPOINT_ENERGY,
-    ENDPOINT_HOME,
-    ENDPOINT_INIT,
+    ENDPOINT_GET_AFT,
+    ENDPOINT_INIT_AUTH,
     ENDPOINT_LISTING,
-    ENDPOINT_LOGIN,
     ENDPOINT_PAYMENT,
     ENDPOINT_SELECT,
+    ENDPOINT_SEND_PIN,
     ENDPOINT_USAGE,
+    ENDPOINT_VERIFY_PIN,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class CannotConnectError(Exception):
@@ -36,20 +41,12 @@ class ApiError(Exception):
     """Non-zero returnCode from the API."""
 
 
-def _extract_csrf_token(html: str) -> str | None:
-    """Extract __RequestVerificationToken from HTML hidden input or meta tag."""
-    match = re.search(
-        r'name="__RequestVerificationToken"[^>]+value="([^"]+)"', html
-    )
-    if match:
-        return match.group(1)
-    # Also try meta tag variant
-    match = re.search(
-        r'name="RequestVerificationToken"\s+content="([^"]+)"', html
-    )
-    if match:
-        return match.group(1)
-    return None
+class OTPRequiredError(Exception):
+    """MFA required; call async_send_pin() after picking a delivery method."""
+
+    def __init__(self, send_methods: list[str]) -> None:
+        self.send_methods = send_methods
+        super().__init__(f"OTP required; methods: {send_methods}")
 
 
 class DominionEnergySCClient:
@@ -71,62 +68,175 @@ class DominionEnergySCClient:
         }
 
     async def async_login(self, username: str, password: str) -> None:
-        """Three-phase ASP.NET forms auth login."""
-        # Phase 1: GET login page, extract CSRF token + session cookie
-        try:
-            async with self._session.get(
-                BASE_URL + ENDPOINT_LOGIN,
-                allow_redirects=True,
-            ) as resp:
-                if resp.status != 200:
-                    raise CannotConnectError(
-                        f"Login page returned HTTP {resp.status}"
-                    )
-                html = await resp.text()
-        except aiohttp.ClientError as err:
-            raise CannotConnectError(str(err)) from err
+        """Authenticate via JSON REST API.
 
-        login_csrf = _extract_csrf_token(html)
-        if not login_csrf:
-            raise CannotConnectError("Could not find CSRF token on login page")
-
-        # Phase 2: POST credentials
-        form_data = aiohttp.FormData()
-        form_data.add_field("UserName", username)
-        form_data.add_field("Password", password)
-        form_data.add_field("__RequestVerificationToken", login_csrf)
-
+        Raises OTPRequiredError if MFA is required (with delivery method list).
+        Raises InvalidCredentialsError on bad credentials.
+        Sets self._api_csrf_token on success.
+        """
         try:
             async with self._session.post(
-                BASE_URL + ENDPOINT_LOGIN,
-                data=form_data,
+                BASE_URL + ENDPOINT_AUTH,
+                json={"userName": username, "password": password, "_df": ""},
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
                 allow_redirects=True,
             ) as resp:
-                final_url = str(resp.url)
-                html_after = await resp.text()
+                payload = await resp.json(content_type=None)
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
 
-        # If we ended up back at the login page, credentials are wrong
-        if ENDPOINT_LOGIN.rstrip("/") in final_url.rstrip("/"):
-            raise InvalidCredentialsError("Redirected back to login — bad credentials")
+        _LOGGER.debug("Authenticate response: %s", payload)
 
-        # Phase 3: GET home page for API CSRF token
+        return_code = str(payload.get("returnCode", "0"))
+
+        # MFA required: returnCode indicates it, or a dedicated mfa/pin field is set
+        mfa_required = (
+            payload.get("requiresMFA")
+            or payload.get("mfaRequired")
+            or payload.get("pinRequired")
+            or return_code in ("2", "3", "10")  # common MFA codes; expand if needed
+        )
+
+        if mfa_required:
+            send_methods = await self._async_get_send_methods()
+            raise OTPRequiredError(send_methods)
+
+        if return_code not in ("0", "1"):
+            _LOGGER.error(
+                "Authenticate failed with returnCode=%s message=%s",
+                return_code,
+                payload.get("pageMessage"),
+            )
+            raise InvalidCredentialsError(
+                f"returnCode={return_code}: {payload.get('pageMessage')}"
+            )
+
+        # Also treat an explicit success=False as bad credentials
+        if payload.get("success") is False or payload.get("isAuthenticated") is False:
+            raise InvalidCredentialsError("Authentication rejected by server")
+
+        await self.async_get_aft()
+
+    async def _async_get_send_methods(self) -> list[str]:
+        """Call InitAuthentication and return list of masked delivery options."""
         try:
             async with self._session.get(
-                BASE_URL + ENDPOINT_HOME,
+                BASE_URL + ENDPOINT_INIT_AUTH,
+                headers={
+                    "Accept": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
                 allow_redirects=True,
             ) as resp:
-                home_html = await resp.text()
+                payload = await resp.json(content_type=None)
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
 
-        api_token = _extract_csrf_token(home_html)
-        if not api_token:
-            # If we can't get the API token, we probably got redirected to login
-            raise SessionExpiredError("Could not extract API CSRF token from home page")
+        _LOGGER.debug("InitAuthentication response: %s", payload)
 
-        self._api_csrf_token = api_token
+        # Response may be list directly or nested under data/sendMethods/etc.
+        data = payload.get("data", payload)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("sendMethods", "methods", "deliveryOptions"):
+                if key in data:
+                    return data[key]
+        # Fallback: return the raw payload as a single-item list so the flow can proceed
+        return [str(data)]
+
+    async def async_send_pin(self, send_method: str) -> None:
+        """Send OTP to the chosen delivery method."""
+        try:
+            async with self._session.post(
+                BASE_URL + ENDPOINT_SEND_PIN,
+                json={"sendMethod": send_method, "_df": ""},
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                allow_redirects=True,
+            ) as resp:
+                payload = await resp.json(content_type=None)
+        except aiohttp.ClientError as err:
+            raise CannotConnectError(str(err)) from err
+
+        _LOGGER.debug("SendPINCode response: %s", payload)
+
+    async def async_verify_pin(self, pin_code: str) -> None:
+        """Verify OTP and register device to skip MFA on subsequent logins.
+
+        Raises InvalidCredentialsError if the code is wrong/expired.
+        """
+        try:
+            async with self._session.post(
+                BASE_URL + ENDPOINT_VERIFY_PIN,
+                json={"PINcode": pin_code, "registerDevice": True, "_df": ""},
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                allow_redirects=True,
+            ) as resp:
+                payload = await resp.json(content_type=None)
+        except aiohttp.ClientError as err:
+            raise CannotConnectError(str(err)) from err
+
+        _LOGGER.debug("VerifyPIN response: %s", payload)
+
+        return_code = str(payload.get("returnCode", "0"))
+        if return_code not in ("0", "1"):
+            raise InvalidCredentialsError(
+                f"VerifyPIN failed returnCode={return_code}: {payload.get('pageMessage')}"
+            )
+
+        if payload.get("success") is False or payload.get("isValid") is False:
+            raise InvalidCredentialsError("OTP verification rejected by server")
+
+        await self.async_get_aft()
+
+    async def async_get_aft(self) -> None:
+        """Retrieve the anti-forgery token and store it for API calls."""
+        try:
+            async with self._session.get(
+                BASE_URL + ENDPOINT_GET_AFT,
+                headers={
+                    "Accept": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                allow_redirects=True,
+            ) as resp:
+                payload = await resp.json(content_type=None)
+        except aiohttp.ClientError as err:
+            raise CannotConnectError(str(err)) from err
+
+        _LOGGER.debug("GetAFT response: %s", payload)
+
+        # Token may be at top-level "data", nested, or a bare string
+        data = payload.get("data", payload)
+        if isinstance(data, str):
+            self._api_csrf_token = data
+        elif isinstance(data, dict):
+            for key in ("token", "aft", "antiForgerToken", "__RequestVerificationToken"):
+                if key in data:
+                    self._api_csrf_token = data[key]
+                    break
+            else:
+                # Last resort: use the first string value found
+                for v in data.values():
+                    if isinstance(v, str) and v:
+                        self._api_csrf_token = v
+                        break
+        else:
+            _LOGGER.warning("Unexpected GetAFT payload shape: %s", payload)
+
+        _LOGGER.debug("AFT token set: %s", bool(self._api_csrf_token))
 
     def _check_session_expired(self, resp: aiohttp.ClientResponse) -> None:
         """Raise SessionExpiredError if response indicates session loss."""
@@ -136,8 +246,8 @@ class DominionEnergySCClient:
                 f"Expected JSON but got content-type: {content_type}"
             )
         final_url = str(resp.url)
-        if ENDPOINT_LOGIN.rstrip("/") in final_url:
-            raise SessionExpiredError("API call redirected to login page")
+        if ENDPOINT_AUTH.rstrip("/") in final_url:
+            raise SessionExpiredError("API call redirected to login endpoint")
 
     async def _get_json(self, endpoint: str, params: dict | None = None) -> Any:
         """GET an API endpoint and return parsed JSON data field."""
@@ -201,7 +311,7 @@ class DominionEnergySCClient:
 
     async def async_get_account_summary(self) -> dict:
         """Return account summary: balance, due date, last payment."""
-        return await self._get_json(ENDPOINT_INIT)
+        return await self._get_json(ENDPOINT_ACCOUNT_INIT)
 
     async def async_get_payment_widget(self) -> dict:
         """Return numeric balance and due date from payment widget."""
