@@ -89,7 +89,8 @@ class DominionEnergySCClient:
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
 
-        _LOGGER.info("Authenticate response: %s", payload)
+        _LOGGER.warning("Authenticate response (all keys): %s", list(payload.keys()))
+        _LOGGER.warning("Authenticate response (full): %s", payload)
 
         has_return_code = "returnCode" in payload
         return_code = str(payload.get("returnCode", "-1"))
