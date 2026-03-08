@@ -109,6 +109,17 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors={"base": "unknown"},
             )
 
+        # Validate the listing actually contains account data before proceeding
+        has_account = listing.get("accountNumber") or listing.get("accountListing")
+        if not has_account:
+            _LOGGER.error("Account listing returned no accounts: %s", listing)
+            await self._async_close_session()
+            return self.async_show_form(
+                step_id="user",
+                data_schema=STEP_USER_DATA_SCHEMA,
+                errors={"base": "no_accounts"},
+            )
+
         await self._async_close_session()
 
         if self._is_reauth:

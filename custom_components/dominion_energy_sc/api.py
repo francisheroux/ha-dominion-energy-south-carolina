@@ -89,9 +89,10 @@ class DominionEnergySCClient:
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
 
-        _LOGGER.debug("Authenticate response: %s", payload)
+        _LOGGER.info("Authenticate response: %s", payload)
 
-        return_code = str(payload.get("returnCode", "0"))
+        has_return_code = "returnCode" in payload
+        return_code = str(payload.get("returnCode", "-1"))
 
         # MFA required: returnCode indicates it, or a dedicated mfa/pin field is set
         mfa_required = (
@@ -106,14 +107,23 @@ class DominionEnergySCClient:
             raise OTPRequiredError(send_methods)
 
         if return_code not in ("0", "1"):
-            _LOGGER.error(
-                "Authenticate failed with returnCode=%s message=%s",
-                return_code,
-                payload.get("pageMessage"),
+            # If returnCode was absent, allow through if the server signals success
+            # via explicit boolean fields instead.
+            explicit_success = (
+                payload.get("success") is True
+                or payload.get("isAuthenticated") is True
             )
-            raise InvalidCredentialsError(
-                f"returnCode={return_code}: {payload.get('pageMessage')}"
-            )
+            if not has_return_code and explicit_success:
+                pass  # API uses alternative success signaling; proceed
+            else:
+                _LOGGER.error(
+                    "Authenticate failed with returnCode=%s message=%s",
+                    return_code if has_return_code else "absent",
+                    payload.get("pageMessage"),
+                )
+                raise InvalidCredentialsError(
+                    f"returnCode={return_code}: {payload.get('pageMessage')}"
+                )
 
         # Also treat an explicit success=False as bad credentials
         if payload.get("success") is False or payload.get("isAuthenticated") is False:

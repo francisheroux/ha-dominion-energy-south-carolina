@@ -14,6 +14,7 @@ from .api import (
     CannotConnectError,
     DominionEnergySCClient,
     InvalidCredentialsError,
+    OTPRequiredError,
     SessionExpiredError,
 )
 from .const import CONF_PASSWORD, CONF_USERNAME, DOMAIN, SCAN_INTERVAL
@@ -207,8 +208,12 @@ class DominionEnergySCCoordinator(DataUpdateCoordinator[dict[str, AccountData]])
                 return await self._async_do_update()
             except InvalidCredentialsError as err:
                 raise ConfigEntryAuthFailed("Credentials invalid after re-auth") from err
+            except OTPRequiredError as err:
+                raise ConfigEntryAuthFailed("MFA required — please re-authenticate") from err
             except (CannotConnectError, SessionExpiredError) as err:
                 raise UpdateFailed(f"Re-auth failed: {err}") from err
+        except OTPRequiredError as err:
+            raise ConfigEntryAuthFailed("MFA required — please re-authenticate") from err
         except InvalidCredentialsError as err:
             raise ConfigEntryAuthFailed("Invalid credentials") from err
         except CannotConnectError as err:
