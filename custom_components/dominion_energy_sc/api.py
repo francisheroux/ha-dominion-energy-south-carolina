@@ -90,6 +90,15 @@ class DominionEnergySCClient:
             _LOGGER.debug("CSRF token extracted from login page")
         else:
             _LOGGER.warning("Could not extract __RequestVerificationToken from /access/")
+            # Fallback: read from the __RequestVerificationToken cookie set by /access/
+            csrf_cookie = self._session.cookie_jar.filter_cookies(
+                BASE_URL + ENDPOINT_ACCESS
+            ).get("__RequestVerificationToken")
+            if csrf_cookie:
+                self._api_csrf_token = csrf_cookie.value
+                _LOGGER.debug("CSRF token extracted from cookie jar (fallback)")
+            else:
+                _LOGGER.warning("CSRF token could not be extracted from HTML or cookies")
 
     async def async_login(self, username: str, password: str) -> None:
         """Authenticate via JSON REST API.
@@ -100,6 +109,12 @@ class DominionEnergySCClient:
         """
         await self.async_setup_session()
 
+        _LOGGER.debug(
+            "Auth attempt: CSRF token present=%s len=%d",
+            bool(self._api_csrf_token),
+            len(self._api_csrf_token) if self._api_csrf_token else 0,
+        )
+
         try:
             async with self._session.post(
                 BASE_URL + ENDPOINT_AUTH,
@@ -109,10 +124,13 @@ class DominionEnergySCClient:
                     "Accept": "application/json, text/javascript, */*; q=0.01",
                     "Content-Type": "application/json",
                     "isajax": "true",
+                    "Origin": BASE_URL,
+                    "Referer": BASE_URL + ENDPOINT_ACCESS,
                     "X-Requested-With": "XMLHttpRequest",
                 },
                 allow_redirects=True,
             ) as resp:
+                _LOGGER.debug("Authenticate HTTP status: %s", resp.status)
                 payload = await resp.json(content_type=None)
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
