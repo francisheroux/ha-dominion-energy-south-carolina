@@ -217,6 +217,14 @@ class DominionEnergySCClient:
             for key in ("sendMethods", "methods", "deliveryOptions"):
                 if key in data:
                     return data[key]
+            # userInfo structure: {"phoneNumbers": [...], "emailAddresses": [...]}
+            user_info = data.get("userInfo", {})
+            if user_info:
+                methods = []
+                methods.extend(user_info.get("phoneNumbers", []))
+                methods.extend(user_info.get("emailAddresses", []))
+                if methods:
+                    return methods
         # Fallback: return the raw payload as a single-item list so the flow can proceed
         return [str(data)]
 
