@@ -157,6 +157,7 @@ class DominionEnergySCClient:
             or payload.get("mfaRequired")
             or payload.get("pinRequired")
             or return_code in ("2", "3", "10")  # common MFA codes; expand if needed
+            or payload.get("data", {}).get("status") == "twoFA"
         )
 
         if mfa_required:
@@ -194,7 +195,10 @@ class DominionEnergySCClient:
             async with self._session.get(
                 BASE_URL + ENDPOINT_INIT_AUTH,
                 headers={
+                    "__requestverificationtoken": self._api_csrf_token or "",
                     "Accept": "application/json",
+                    "isajax": "true",
+                    "Referer": BASE_URL + ENDPOINT_ACCESS,
                     "X-Requested-With": "XMLHttpRequest",
                 },
                 allow_redirects=True,

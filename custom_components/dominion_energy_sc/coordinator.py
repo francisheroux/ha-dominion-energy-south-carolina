@@ -79,7 +79,10 @@ class DominionEnergySCCoordinator(DataUpdateCoordinator[dict[str, AccountData]])
         """Create a new aiohttp session with our cookie jar."""
         if self._session:
             self.hass.async_create_task(self._session.close())
-        self._session = aiohttp.ClientSession(cookie_jar=self._cookie_jar)
+        self._session = aiohttp.ClientSession(
+            cookie_jar=self._cookie_jar,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"},
+        )
         self._client = DominionEnergySCClient(self._session)
 
     async def _async_login(self) -> None:
