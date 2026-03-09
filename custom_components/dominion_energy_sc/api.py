@@ -1,6 +1,7 @@
 """Dominion Energy South Carolina API client."""
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any
@@ -237,11 +238,13 @@ class DominionEnergySCClient:
                 headers=self._api_headers,
                 allow_redirects=True,
             ) as resp:
-                payload = await resp.json(content_type=None)
+                text = await resp.text()
+                _LOGGER.debug("SendPINCode response (HTTP %s): %s", resp.status, text[:200])
+                if not text.strip():
+                    return  # empty body = accepted
+                payload = json.loads(text)
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
-
-        _LOGGER.debug("SendPINCode response: %s", payload)
 
         if payload.get("success") is False or payload.get("status") is False:
             raise CannotConnectError(
@@ -260,7 +263,12 @@ class DominionEnergySCClient:
                 headers=self._api_headers,
                 allow_redirects=True,
             ) as resp:
-                payload = await resp.json(content_type=None)
+                text = await resp.text()
+                if not text.strip():
+                    _LOGGER.debug("VerifyPIN returned empty body (HTTP %s) — treating as success", resp.status)
+                    await self.async_get_aft()
+                    return
+                payload = json.loads(text)
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
 
