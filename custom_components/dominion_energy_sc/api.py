@@ -264,11 +264,21 @@ class DominionEnergySCClient:
                 allow_redirects=True,
             ) as resp:
                 text = await resp.text()
+                _LOGGER.debug("VerifyPIN response (HTTP %s): %s", resp.status, text[:200])
                 if not text.strip():
-                    _LOGGER.debug("VerifyPIN returned empty body (HTTP %s) — treating as success", resp.status)
+                    _LOGGER.debug("VerifyPIN returned empty body — treating as success")
                     await self.async_get_aft()
                     return
-                payload = json.loads(text)
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    if resp.status < 300:
+                        _LOGGER.debug("VerifyPIN returned non-JSON (HTTP %s) — treating as success", resp.status)
+                        await self.async_get_aft()
+                        return
+                    raise CannotConnectError(
+                        f"VerifyPIN returned non-JSON response (HTTP {resp.status})"
+                    )
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
 
