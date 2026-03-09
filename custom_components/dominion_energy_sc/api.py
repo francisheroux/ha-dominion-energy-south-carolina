@@ -234,11 +234,7 @@ class DominionEnergySCClient:
             async with self._session.post(
                 BASE_URL + ENDPOINT_SEND_PIN,
                 json={"sendMethod": send_method, "_df": ""},
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "X-Requested-With": "XMLHttpRequest",
-                },
+                headers=self._api_headers,
                 allow_redirects=True,
             ) as resp:
                 payload = await resp.json(content_type=None)
@@ -246,6 +242,11 @@ class DominionEnergySCClient:
             raise CannotConnectError(str(err)) from err
 
         _LOGGER.debug("SendPINCode response: %s", payload)
+
+        if payload.get("success") is False or payload.get("status") is False:
+            raise CannotConnectError(
+                f"SendPINCode rejected: {payload.get('pageMessage') or payload}"
+            )
 
     async def async_verify_pin(self, pin_code: str) -> None:
         """Verify OTP and register device to skip MFA on subsequent logins.
@@ -256,11 +257,7 @@ class DominionEnergySCClient:
             async with self._session.post(
                 BASE_URL + ENDPOINT_VERIFY_PIN,
                 json={"PINcode": pin_code, "registerDevice": True, "_df": ""},
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "X-Requested-With": "XMLHttpRequest",
-                },
+                headers=self._api_headers,
                 allow_redirects=True,
             ) as resp:
                 payload = await resp.json(content_type=None)
