@@ -153,7 +153,7 @@ class DominionEnergySCClient:
             pass
 
     async def _async_get_send_methods(self) -> list[str]:
-        """Fetch MFA delivery options with a small delay to appease the WAF."""
+        """Fetch MFA delivery options and extract the masked descriptions."""
         await asyncio.sleep(1.2)  # Simulate human "thinking" time
 
         # Override headers specifically for this sensitive call
@@ -171,10 +171,18 @@ class DominionEnergySCClient:
             _LOGGER.warning("WAF blocked MFA method fetch (HTTP 555). Try again in a few minutes.")
             raise
 
-        data = payload.get("data", payload)
-        if isinstance(data, list):
-            return data
-        return data.get("sendMethods", ["Email/SMS"])
+        # Dominion returns data as a list of dicts:
+        # [{"type": "Email", "description": "m***@gmail.com"}, ...]
+        data = payload.get("data", [])
+
+        if isinstance(data, list) and len(data) > 0:
+            # Extract only the 'description' strings for the UI
+            methods = [item.get("description") for item in data if item.get("description")]
+            if methods:
+                return methods
+
+        # Fallback if the data structure is unexpected
+        return ["Email", "SMS"]
 
     def _check_session_expired(self, resp: aiohttp.ClientResponse) -> None:
         """Check for session expiry or WAF blocks."""
