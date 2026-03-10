@@ -57,7 +57,8 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
         cookie_jar = aiohttp.CookieJar()
         self._session = aiohttp.ClientSession(
             cookie_jar=cookie_jar,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"},
         )
         self._client = DominionEnergySCClient(self._session)
         return self._client
@@ -310,7 +311,7 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
             except InvalidCredentialsError:
                 errors["base"] = "invalid_credentials"
                 await self._async_close_session()
-            except CannotConnectError:
+            except (CannotConnectError, SessionExpiredError):
                 errors["base"] = "cannot_connect"
                 await self._async_close_session()
             except Exception:  # noqa: BLE001

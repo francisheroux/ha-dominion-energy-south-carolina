@@ -28,30 +28,23 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-
 class CannotConnectError(Exception):
     """Cannot connect to Dominion Energy SC portal."""
-
 
 class InvalidCredentialsError(Exception):
     """Invalid username or password."""
 
-
 class SessionExpiredError(Exception):
-    """Session has expired — coordinator should re-authenticate."""
-
+    """Session has expired."""
 
 class ApiError(Exception):
     """Non-zero returnCode from the API."""
 
-
 class OTPRequiredError(Exception):
-    """MFA required; call async_send_pin() after picking a delivery method."""
-
+    """MFA required."""
     def __init__(self, send_methods: list[str]) -> None:
         self.send_methods = send_methods
         super().__init__(f"OTP required; methods: {send_methods}")
-
 
 class DominionEnergySCClient:
     """Async HTTP client for the Dominion Energy SC customer portal."""
@@ -61,8 +54,8 @@ class DominionEnergySCClient:
         self._api_csrf_token: str | None = None
 
     @property
-    @property
     def _api_headers(self) -> dict[str, str]:
+        """Return standardized headers. Note: No () when calling this."""
         return {
             "__RequestVerificationToken": self._api_csrf_token or "",
             "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -70,100 +63,41 @@ class DominionEnergySCClient:
             "isajax": "true",
             "Origin": BASE_URL,
             "X-Requested-With": "XMLHttpRequest",
-            "Referer": BASE_URL + "/",
-            # Add a realistic User-Agent to bypass WAF blocks
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Referer": f"{BASE_URL}/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
         }
 
     async def async_setup_session(self) -> None:
-        """GET the login page to establish session cookies and extract the CSRF token."""
+        """Establish session and extract CSRF."""
         try:
-            async with self._session.get(
-                BASE_URL + ENDPOINT_ACCESS,
-                allow_redirects=True,
-            ) as resp:
+            async with self._session.get(BASE_URL + ENDPOINT_ACCESS) as resp:
                 html = await resp.text()
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
 
-        match = re.search(
-            r'name="__RequestVerificationToken"[^>]*value="([^"]+)"'
-            r'|value="([^"]+)"[^>]*name="__RequestVerificationToken"',
-            html,
-        )
+        match = re.search(r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', html)
         if match:
-            self._api_csrf_token = match.group(1) or match.group(2)
-            _LOGGER.debug("CSRF token extracted from login page")
+            self._api_csrf_token = match.group(1)
         else:
-            _LOGGER.warning("Could not extract __RequestVerificationToken from /access/")
-            # Fallback: read from the __RequestVerificationToken cookie set by /access/
-            from yarl import URL as _URL
-            csrf_cookie = self._session.cookie_jar.filter_cookies(
-                _URL(BASE_URL)
-            ).get("__RequestVerificationToken")
-            if csrf_cookie:
-                self._api_csrf_token = csrf_cookie.value
-                _LOGGER.debug("CSRF token extracted from cookie jar (fallback)")
-            else:
-                _LOGGER.warning("CSRF token could not be extracted from HTML or cookies")
+            # Fallback to cookies
+            for cookie in self._session.cookie_jar:
+                if cookie.key == "__RequestVerificationToken":
+                    self._api_csrf_token = cookie.value
+                    break
 
     async def async_login(self, username: str, password: str) -> None:
-        """Authenticate via JSON REST API.
-
-        Raises OTPRequiredError if MFA is required (with delivery method list).
-        Raises InvalidCredentialsError on bad credentials.
-        Sets self._api_csrf_token on success.
-        """
+        """Main login entry point."""
         await self.async_setup_session()
 
-        _LOGGER.debug(
-            "Auth attempt: CSRF token present=%s len=%d",
-            bool(self._api_csrf_token),
-            len(self._api_csrf_token) if self._api_csrf_token else 0,
+        payload = await self._post_json(
+            ENDPOINT_AUTH,
+            {"userName": username, "password": password, "_df": ""}
         )
 
-        try:
-            async with self._session.post(
-                BASE_URL + ENDPOINT_AUTH,
-                json={"userName": username, "password": password, "_df": ""},
-                headers={
-                    "__requestverificationtoken": self._api_csrf_token or "",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Content-Type": "application/json",
-                    "isajax": "true",
-                    "Origin": BASE_URL,
-                    "Referer": BASE_URL + ENDPOINT_ACCESS,
-                    "X-Requested-With": "XMLHttpRequest",
-                },
-                allow_redirects=True,
-            ) as resp:
-                _LOGGER.debug("Authenticate HTTP status: %s", resp.status)
-                payload = await resp.json(content_type=None)
-        except aiohttp.ClientError as err:
-            raise CannotConnectError(str(err)) from err
-
-        _LOGGER.info("Authenticate response: %s", payload)
-
-        # Detect ASP.NET exception response format {errorNumber, message, detail}
-        if "detail" in payload and "Exception" in str(payload.get("detail", "")):
-            raise CannotConnectError(
-                f"Server error during authentication: {payload.get('message', 'Unknown error')}"
-            )
-        error_number = payload.get("errorNumber")
-        if error_number is not None and int(error_number) != 0:
-            raise CannotConnectError(
-                f"Server returned errorNumber={error_number}: {payload.get('message')}"
-            )
-
-        has_return_code = "returnCode" in payload
-        return_code = str(payload.get("returnCode", "-1"))
-
-        # MFA required: returnCode indicates it, or a dedicated mfa/pin field is set
+        # Handle MFA Logic
         mfa_required = (
             payload.get("requiresMFA")
-            or payload.get("mfaRequired")
-            or payload.get("pinRequired")
-            or return_code in ("2", "3", "10")  # common MFA codes; expand if needed
+            or str(payload.get("returnCode")) in ("2", "3", "10")
             or payload.get("data", {}).get("status") == "twoFA"
         )
 
@@ -173,247 +107,56 @@ class DominionEnergySCClient:
             send_methods = await self._async_get_send_methods()
             raise OTPRequiredError(send_methods)
 
-        if return_code not in ("0", "1"):
-            # If returnCode was absent, allow through if the server signals success
-            # via explicit boolean fields instead.
-            explicit_success = (
-                payload.get("success") is True
-                or payload.get("isAuthenticated") is True
-            )
-            if not has_return_code and explicit_success:
-                pass  # API uses alternative success signaling; proceed
-            else:
-                _LOGGER.error(
-                    "Authenticate failed with returnCode=%s message=%s",
-                    return_code if has_return_code else "absent",
-                    payload.get("pageMessage"),
-                )
-                raise InvalidCredentialsError(
-                    f"returnCode={return_code}: {payload.get('pageMessage')}"
-                )
-
-        # Also treat an explicit success=False as bad credentials
-        if payload.get("success") is False or payload.get("isAuthenticated") is False:
-            raise InvalidCredentialsError("Authentication rejected by server")
+        if str(payload.get("returnCode", "0")) not in ("0", "1"):
+            raise InvalidCredentialsError(payload.get("pageMessage", "Login failed"))
 
         await self.async_get_aft()
-
-    async def _async_refresh_csrf_from_aft(self) -> None:
-        """Call GetAFT to obtain the new CSRF field token after cookie rotation."""
-        try:
-            async with self._session.get(
-                BASE_URL + ENDPOINT_GET_AFT,
-                headers={
-                    "__requestverificationtoken": self._api_csrf_token or "",
-                    "Accept": "application/json",
-                    "isajax": "true",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": BASE_URL + "/",
-                },
-                allow_redirects=True,
-            ) as resp:
-                text = await resp.text()
-                _LOGGER.debug("GetAFT response (HTTP %s): %s", resp.status, text[:300])
-        except aiohttp.ClientError as err:
-            _LOGGER.warning("GetAFT request failed: %s — CSRF token not refreshed", err)
-            return
-
-        if not text.strip():
-            _LOGGER.warning("GetAFT returned empty body — CSRF token not refreshed")
-            return
-
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
-            _LOGGER.warning(
-                "GetAFT returned non-JSON (%s) — CSRF token not refreshed", text[:100]
-            )
-            return
-
-        new_token = None
-        # Top-level keys
-        for key in ("requestVerificationToken", "__RequestVerificationToken",
-                    "token", "antiForgeryToken", "csrfToken"):
-            if isinstance(payload.get(key), str):
-                new_token = payload[key]
-                break
-
-        # data as dict
-        if new_token is None:
-            data = payload.get("data")
-            if isinstance(data, dict):
-                for key in ("requestVerificationToken", "__RequestVerificationToken",
-                            "token", "antiForgeryToken", "csrfToken", "value"):
-                    if key in data:
-                        new_token = data[key]
-                        break
-
-        # data as HTML string — e.g. '<input ... value="TOKEN" />'
-        if new_token is None:
-            data = payload.get("data")
-            if isinstance(data, str):
-                m = re.search(r'value="([^"]+)"', data)
-                if m:
-                    new_token = m.group(1)
-
-        if new_token:
-            self._api_csrf_token = new_token
-            _LOGGER.debug("CSRF field token refreshed from GetAFT response")
-        else:
-            _LOGGER.warning(
-                "GetAFT response did not contain a recognizable token key "
-                "(keys: %s) — CSRF token not refreshed", list(payload.keys())
-            )
-
-    async def _async_check_device_token(self) -> None:
-        """Probe Verify2FAToken to advance the server MFA state machine.
-
-        The browser always calls this endpoint after GetAFT.  Without it the
-        server may reject SendPINCode with a 555 "Session expired." error.
-        We call it with no token parameter (no registered device), log the
-        response, and continue regardless of the result.
-        """
-        try:
-            async with self._session.get(
-                BASE_URL + ENDPOINT_VERIFY_2FA_TOKEN,
-                headers={
-                    "__requestverificationtoken": self._api_csrf_token or "",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "isajax": "true",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": BASE_URL + "/",
-                },
-                allow_redirects=True,
-            ) as resp:
-                text = await resp.text()
-                _LOGGER.debug(
-                    "Verify2FAToken probe (HTTP %s): %s", resp.status, text[:200]
-                )
-        except aiohttp.ClientError as err:
-            _LOGGER.warning("Verify2FAToken probe failed: %s — continuing", err)
-
-    async def _async_get_send_methods(self) -> list[str]:
-        """Call InitAuthentication and return list of masked delivery options."""
-        try:
-            async with self._session.get(
-                BASE_URL + ENDPOINT_INIT_AUTH,
-                headers={
-                    "__requestverificationtoken": self._api_csrf_token or "",
-                    "Accept": "application/json",
-                    "isajax": "true",
-                    "Referer": BASE_URL + ENDPOINT_ACCESS,
-                    "X-Requested-With": "XMLHttpRequest",
-                },
-                allow_redirects=True,
-            ) as resp:
-                payload = await resp.json(content_type=None)
-        except aiohttp.ClientError as err:
-            raise CannotConnectError(str(err)) from err
-
-        _LOGGER.debug("InitAuthentication response: %s", payload)
-
-        # Response may be list directly or nested under data/sendMethods/etc.
-        data = payload.get("data", payload)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            for key in ("sendMethods", "methods", "deliveryOptions"):
-                if key in data:
-                    return data[key]
-            # userInfo structure: {"phoneNumbers": [...], "emailAddresses": [...]}
-            user_info = data.get("userInfo", {})
-            if user_info:
-                methods = []
-                methods.extend(user_info.get("phoneNumbers", []))
-                methods.extend(user_info.get("emailAddresses", []))
-                if methods:
-                    return methods
-        # Fallback: return the raw payload as a single-item list so the flow can proceed
-        return [str(data)]
 
     async def async_send_pin(self, send_method: str) -> None:
-        """Send OTP to the chosen delivery method."""
-        # This uses your helper which handles headers and session checks automatically
-        payload = await self._post_json(
-            ENDPOINT_SEND_PIN,
-            {"sendMethod": send_method, "_df": ""}
-        )
-
-        # Dominion often returns a simple boolean 'true' or a dict with 'status'
-        if isinstance(payload, dict):
-            if payload.get("success") is False or payload.get("status") is False:
-                raise ApiError(
-                    f"SendPINCode rejected: {payload.get('pageMessage') or 'Unknown error'}"
-                )
-        _LOGGER.debug("SendPINCode successful")
+        """Send the MFA PIN."""
+        await self._post_json(ENDPOINT_SEND_PIN, {"sendMethod": send_method, "_df": ""})
 
     async def async_verify_pin(self, pin_code: str) -> None:
-        """Verify OTP and register device to skip MFA on subsequent logins.
+        """Verify the MFA PIN."""
+        payload = await self._post_json(
+            ENDPOINT_VERIFY_PIN,
+            {"PINcode": pin_code, "registerDevice": True, "_df": ""}
+        )
+        if str(payload.get("returnCode", "0")) not in ("0", "1"):
+            raise InvalidCredentialsError("Invalid OTP code")
+        await self.async_get_aft()
 
-        Raises InvalidCredentialsError if the code is wrong/expired.
-        """
+    async def _post_json(self, endpoint: str, body: dict) -> Any:
+        """Helper for POST requests with error handling."""
         try:
             async with self._session.post(
-                BASE_URL + ENDPOINT_VERIFY_PIN,
-                json={"PINcode": pin_code, "registerDevice": True, "_df": ""},
-                headers=self._api_headers,
-                allow_redirects=False,
+                BASE_URL + endpoint,
+                headers=self._api_headers,  # NO PARENTHESES HERE
+                json=body
             ) as resp:
-                text = await resp.text()
-                _LOGGER.debug(
-                    "VerifyPIN response (HTTP %s, url=%s): %s",
-                    resp.status, resp.url, text[:200],
-                )
-                if not text.strip() or resp.status in range(300, 400):
-                    # 302 redirect = success (POST-Redirect-GET pattern)
-                    # empty body = accepted
-                    _LOGGER.debug(
-                        "VerifyPIN returned HTTP %s — treating as success", resp.status
-                    )
-                    await self.async_get_aft()
-                    return
-                try:
-                    payload = json.loads(text)
-                except json.JSONDecodeError:
-                    if resp.status < 300:
-                        _LOGGER.debug(
-                            "VerifyPIN returned non-JSON HTTP %s — treating as success",
-                            resp.status,
-                        )
-                        await self.async_get_aft()
-                        return
-                    _LOGGER.warning(
-                        "VerifyPIN rejected (HTTP %s): %s", resp.status, text[:300]
-                    )
-                    raise CannotConnectError(
-                        f"VerifyPIN returned HTTP {resp.status}: {text[:100]}"
-                    )
+                self._check_session_expired(resp)
+                return await resp.json(content_type=None)
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
 
-        _LOGGER.debug("VerifyPIN response: %s", payload)
-
-        return_code = str(payload.get("returnCode", "0"))
-        if return_code not in ("0", "1"):
-            raise InvalidCredentialsError(
-                f"VerifyPIN failed returnCode={return_code}: {payload.get('pageMessage')}"
-            )
-
-        if payload.get("success") is False or payload.get("isValid") is False:
-            raise InvalidCredentialsError("OTP verification rejected by server")
-
-        await self.async_get_aft()
-
-    async def async_get_aft(self) -> None:
-        """Call GetAFT for protocol compliance; updates CSRF token if returned."""
-        await self._async_refresh_csrf_from_aft()
+    async def _get_json(self, endpoint: str, params: dict | None = None) -> Any:
+        """Helper for GET requests."""
+        try:
+            async with self._session.get(
+                BASE_URL + endpoint,
+                headers=self._api_headers, # NO PARENTHESES HERE
+                params=params
+            ) as resp:
+                self._check_session_expired(resp)
+                return await resp.json(content_type=None)
+        except aiohttp.ClientError as err:
+            raise CannotConnectError(str(err)) from err
 
     def _check_session_expired(self, resp: aiohttp.ClientResponse) -> None:
-        """Raise SessionExpiredError if response indicates session loss."""
-        # If we get a 401, 403, or 555, the session is definitely dead
         if resp.status in (401, 403, 555):
-            raise SessionExpiredError(f"Session invalidated by server (HTTP {resp.status})")
-
+            raise SessionExpiredError("Session expired")
+        if "json" not in (resp.content_type or "").lower():
+            raise SessionExpiredError("Non-JSON response (WAF block or redirect)")
         content_type = resp.content_type or ""
         if "json" not in content_type.lower():
             # If the server sends HTML instead of JSON, we've likely been redirected to a login page
