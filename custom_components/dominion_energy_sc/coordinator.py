@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass, field
 
 import aiohttp
+from yarl import URL
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -17,7 +18,7 @@ from .api import (
     OTPRequiredError,
     SessionExpiredError,
 )
-from .const import CONF_PASSWORD, CONF_USERNAME, DOMAIN, SCAN_INTERVAL
+from .const import BASE_URL, CONF_COOKIES, CONF_PASSWORD, CONF_USERNAME, DOMAIN, SCAN_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -72,6 +73,9 @@ class DominionEnergySCCoordinator(DataUpdateCoordinator[dict[str, AccountData]])
         )
         self._entry = entry
         self._cookie_jar = aiohttp.CookieJar()
+        saved_cookies = entry.data.get(CONF_COOKIES, {})
+        if saved_cookies:
+            self._cookie_jar.update_cookies(saved_cookies, URL(BASE_URL))
         self._session: aiohttp.ClientSession | None = None
         self._client: DominionEnergySCClient | None = None
 

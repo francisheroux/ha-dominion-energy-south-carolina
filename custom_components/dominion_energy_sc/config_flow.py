@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 import aiohttp
+from yarl import URL as _URL
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult
 from homeassistant.config_entries import OptionsFlow  # noqa: F401 (reserved for future)
@@ -16,7 +17,7 @@ from .api import (
     InvalidCredentialsError,
     OTPRequiredError,
 )
-from .const import CONF_COOKIES, CONF_PASSWORD, CONF_USERNAME, DOMAIN
+from .const import BASE_URL, CONF_COOKIES, CONF_PASSWORD, CONF_USERNAME, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
         self._client: DominionEnergySCClient | None = None
         self._session: aiohttp.ClientSession | None = None
         self._is_reauth: bool = False
+        self._cookies: dict = {}
 
     async def _async_close_session(self) -> None:
         """Close the aiohttp session if open."""
@@ -123,6 +125,14 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors={"base": "no_accounts"},
             )
 
+        # Save cookies before closing (prevents MFA on every HA restart)
+        if self._session is not None:
+            self._cookies = {
+                name: morsel.value
+                for name, morsel in self._session.cookie_jar.filter_cookies(
+                    _URL(BASE_URL)
+                ).items()
+            }
         await self._async_close_session()
 
         if self._is_reauth:
@@ -132,7 +142,7 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
                 data_updates={
                     CONF_USERNAME: self._username,
                     CONF_PASSWORD: self._password,
-                    CONF_COOKIES: {},
+                    CONF_COOKIES: self._cookies,
                 },
             )
 
@@ -145,7 +155,7 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
                 data={
                     CONF_USERNAME: self._username,
                     CONF_PASSWORD: self._password,
-                    CONF_COOKIES: {},
+                    CONF_COOKIES: self._cookies,
                 },
             )
 
@@ -201,7 +211,8 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
                 await self._client.async_verify_pin(pin_code)
             except InvalidCredentialsError:
                 errors["base"] = "invalid_otp"
-            except CannotConnectError:
+            except CannotConnectError as err:
+                _LOGGER.warning("CannotConnectError verifying PIN: %s", err)
                 errors["base"] = "cannot_connect"
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Unexpected error verifying PIN")
@@ -237,7 +248,7 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
                 data={
                     CONF_USERNAME: self._username,
                     CONF_PASSWORD: self._password,
-                    CONF_COOKIES: {},
+                    CONF_COOKIES: self._cookies,
                 },
             )
 
@@ -296,13 +307,20 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
             else:
                 self._username = username
                 self._password = password
+                if self._session is not None:
+                    self._cookies = {
+                        name: morsel.value
+                        for name, morsel in self._session.cookie_jar.filter_cookies(
+                            _URL(BASE_URL)
+                        ).items()
+                    }
                 await self._async_close_session()
                 return self.async_update_reload_and_abort(
                     reauth_entry,
                     data_updates={
                         CONF_USERNAME: username,
                         CONF_PASSWORD: password,
-                        CONF_COOKIES: {},
+                        CONF_COOKIES: self._cookies,
                     },
                 )
 

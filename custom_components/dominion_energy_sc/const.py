@@ -12,6 +12,7 @@ ENDPOINT_INIT_AUTH = "/fusionapi/LoginWebApi/InitAuthentication/"
 ENDPOINT_SEND_PIN = "/fusionapi/LoginWebApi/SendPINCode/"
 ENDPOINT_VERIFY_PIN = "/fusionapi/LoginWebApi/VerifyPIN/"
 ENDPOINT_GET_AFT = "/fusionapi/LoginWebApi/GetAFT/"
+ENDPOINT_VERIFY_2FA_TOKEN = "/fusionapi/LoginWebApi/Verify2FAToken/"
 
 # Account/billing endpoints
 ENDPOINT_ACCOUNT_INIT = "/fusionapi/AccountSummaryWebApi/InitAccount/"

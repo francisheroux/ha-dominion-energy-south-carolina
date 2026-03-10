@@ -22,6 +22,7 @@ from .const import (
     ENDPOINT_SELECT,
     ENDPOINT_SEND_PIN,
     ENDPOINT_USAGE,
+    ENDPOINT_VERIFY_2FA_TOKEN,
     ENDPOINT_VERIFY_PIN,
 )
 
@@ -66,6 +67,7 @@ class DominionEnergySCClient:
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Content-Type": "application/json",
             "isajax": "true",
+            "Origin": BASE_URL,
             "X-Requested-With": "XMLHttpRequest",
             "Referer": BASE_URL + "/",
         }
@@ -92,8 +94,9 @@ class DominionEnergySCClient:
         else:
             _LOGGER.warning("Could not extract __RequestVerificationToken from /access/")
             # Fallback: read from the __RequestVerificationToken cookie set by /access/
+            from yarl import URL as _URL
             csrf_cookie = self._session.cookie_jar.filter_cookies(
-                BASE_URL + ENDPOINT_ACCESS
+                _URL(BASE_URL)
             ).get("__RequestVerificationToken")
             if csrf_cookie:
                 self._api_csrf_token = csrf_cookie.value
@@ -162,6 +165,8 @@ class DominionEnergySCClient:
         )
 
         if mfa_required:
+            await self._async_refresh_csrf_from_aft()
+            await self._async_check_device_token()
             send_methods = await self._async_get_send_methods()
             raise OTPRequiredError(send_methods)
 
@@ -189,6 +194,100 @@ class DominionEnergySCClient:
             raise InvalidCredentialsError("Authentication rejected by server")
 
         await self.async_get_aft()
+
+    async def _async_refresh_csrf_from_aft(self) -> None:
+        """Call GetAFT to obtain the new CSRF field token after cookie rotation."""
+        try:
+            async with self._session.get(
+                BASE_URL + ENDPOINT_GET_AFT,
+                headers={
+                    "__requestverificationtoken": self._api_csrf_token or "",
+                    "Accept": "application/json",
+                    "isajax": "true",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": BASE_URL + "/",
+                },
+                allow_redirects=True,
+            ) as resp:
+                text = await resp.text()
+                _LOGGER.debug("GetAFT response (HTTP %s): %s", resp.status, text[:300])
+        except aiohttp.ClientError as err:
+            _LOGGER.warning("GetAFT request failed: %s — CSRF token not refreshed", err)
+            return
+
+        if not text.strip():
+            _LOGGER.warning("GetAFT returned empty body — CSRF token not refreshed")
+            return
+
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            _LOGGER.warning(
+                "GetAFT returned non-JSON (%s) — CSRF token not refreshed", text[:100]
+            )
+            return
+
+        new_token = None
+        # Top-level keys
+        for key in ("requestVerificationToken", "__RequestVerificationToken",
+                    "token", "antiForgeryToken", "csrfToken"):
+            if isinstance(payload.get(key), str):
+                new_token = payload[key]
+                break
+
+        # data as dict
+        if new_token is None:
+            data = payload.get("data")
+            if isinstance(data, dict):
+                for key in ("requestVerificationToken", "__RequestVerificationToken",
+                            "token", "antiForgeryToken", "csrfToken", "value"):
+                    if key in data:
+                        new_token = data[key]
+                        break
+
+        # data as HTML string — e.g. '<input ... value="TOKEN" />'
+        if new_token is None:
+            data = payload.get("data")
+            if isinstance(data, str):
+                m = re.search(r'value="([^"]+)"', data)
+                if m:
+                    new_token = m.group(1)
+
+        if new_token:
+            self._api_csrf_token = new_token
+            _LOGGER.debug("CSRF field token refreshed from GetAFT response")
+        else:
+            _LOGGER.warning(
+                "GetAFT response did not contain a recognizable token key "
+                "(keys: %s) — CSRF token not refreshed", list(payload.keys())
+            )
+
+    async def _async_check_device_token(self) -> None:
+        """Probe Verify2FAToken to advance the server MFA state machine.
+
+        The browser always calls this endpoint after GetAFT.  Without it the
+        server may reject SendPINCode with a 555 "Session expired." error.
+        We call it with no token parameter (no registered device), log the
+        response, and continue regardless of the result.
+        """
+        try:
+            async with self._session.get(
+                BASE_URL + ENDPOINT_VERIFY_2FA_TOKEN,
+                headers={
+                    "__requestverificationtoken": self._api_csrf_token or "",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "isajax": "true",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": BASE_URL + "/",
+                },
+                allow_redirects=True,
+            ) as resp:
+                text = await resp.text()
+                _LOGGER.debug(
+                    "Verify2FAToken probe (HTTP %s): %s", resp.status, text[:200]
+                )
+        except aiohttp.ClientError as err:
+            _LOGGER.warning("Verify2FAToken probe failed: %s — continuing", err)
 
     async def _async_get_send_methods(self) -> list[str]:
         """Call InitAuthentication and return list of masked delivery options."""
@@ -261,23 +360,36 @@ class DominionEnergySCClient:
                 BASE_URL + ENDPOINT_VERIFY_PIN,
                 json={"PINcode": pin_code, "registerDevice": True, "_df": ""},
                 headers=self._api_headers,
-                allow_redirects=True,
+                allow_redirects=False,
             ) as resp:
                 text = await resp.text()
-                _LOGGER.debug("VerifyPIN response (HTTP %s): %s", resp.status, text[:200])
-                if not text.strip():
-                    _LOGGER.debug("VerifyPIN returned empty body — treating as success")
+                _LOGGER.debug(
+                    "VerifyPIN response (HTTP %s, url=%s): %s",
+                    resp.status, resp.url, text[:200],
+                )
+                if not text.strip() or resp.status in range(300, 400):
+                    # 302 redirect = success (POST-Redirect-GET pattern)
+                    # empty body = accepted
+                    _LOGGER.debug(
+                        "VerifyPIN returned HTTP %s — treating as success", resp.status
+                    )
                     await self.async_get_aft()
                     return
                 try:
                     payload = json.loads(text)
                 except json.JSONDecodeError:
                     if resp.status < 300:
-                        _LOGGER.debug("VerifyPIN returned non-JSON (HTTP %s) — treating as success", resp.status)
+                        _LOGGER.debug(
+                            "VerifyPIN returned non-JSON HTTP %s — treating as success",
+                            resp.status,
+                        )
                         await self.async_get_aft()
                         return
+                    _LOGGER.warning(
+                        "VerifyPIN rejected (HTTP %s): %s", resp.status, text[:300]
+                    )
                     raise CannotConnectError(
-                        f"VerifyPIN returned non-JSON response (HTTP {resp.status})"
+                        f"VerifyPIN returned HTTP {resp.status}: {text[:100]}"
                     )
         except aiohttp.ClientError as err:
             raise CannotConnectError(str(err)) from err
@@ -296,22 +408,8 @@ class DominionEnergySCClient:
         await self.async_get_aft()
 
     async def async_get_aft(self) -> None:
-        """Call GetAFT for protocol compliance (token comes from /access/ page, not here)."""
-        try:
-            async with self._session.get(
-                BASE_URL + ENDPOINT_GET_AFT,
-                headers={
-                    "__requestverificationtoken": self._api_csrf_token or "",
-                    "Accept": "application/json",
-                    "isajax": "true",
-                    "X-Requested-With": "XMLHttpRequest",
-                },
-                allow_redirects=True,
-            ) as resp:
-                payload = await resp.json(content_type=None)
-        except aiohttp.ClientError as err:
-            raise CannotConnectError(str(err)) from err
-        _LOGGER.debug("GetAFT response: %s", payload)
+        """Call GetAFT for protocol compliance; updates CSRF token if returned."""
+        await self._async_refresh_csrf_from_aft()
 
     def _check_session_expired(self, resp: aiohttp.ClientResponse) -> None:
         """Raise SessionExpiredError if response indicates session loss."""
