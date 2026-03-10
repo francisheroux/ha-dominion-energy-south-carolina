@@ -1,7 +1,6 @@
 """Dominion Energy South Carolina API client."""
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any
@@ -55,7 +54,7 @@ class DominionEnergySCClient:
 
     @property
     def _api_headers(self) -> dict[str, str]:
-        """Return standardized headers. Note: No () when calling this."""
+        """Return standardized headers."""
         return {
             "__RequestVerificationToken": self._api_csrf_token or "",
             "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -79,7 +78,6 @@ class DominionEnergySCClient:
         if match:
             self._api_csrf_token = match.group(1)
         else:
-            # Fallback to cookies
             for cookie in self._session.cookie_jar:
                 if cookie.key == "__RequestVerificationToken":
                     self._api_csrf_token = cookie.value
@@ -89,12 +87,13 @@ class DominionEnergySCClient:
         """Main login entry point."""
         await self.async_setup_session()
 
+        # We return the whole payload here so we can check returnCode/requiresMFA
         payload = await self._post_json(
             ENDPOINT_AUTH,
-            {"userName": username, "password": password, "_df": ""}
+            {"userName": username, "password": password, "_df": ""},
+            unwrap_data=False
         )
 
-        # Handle MFA Logic
         mfa_required = (
             payload.get("requiresMFA")
             or str(payload.get("returnCode")) in ("2", "3", "10")
@@ -120,143 +119,107 @@ class DominionEnergySCClient:
         """Verify the MFA PIN."""
         payload = await self._post_json(
             ENDPOINT_VERIFY_PIN,
-            {"PINcode": pin_code, "registerDevice": True, "_df": ""}
+            {"PINcode": pin_code, "registerDevice": True, "_df": ""},
+            unwrap_data=False
         )
         if str(payload.get("returnCode", "0")) not in ("0", "1"):
             raise InvalidCredentialsError("Invalid OTP code")
         await self.async_get_aft()
 
-    async def _post_json(self, endpoint: str, body: dict) -> Any:
-        """Helper for POST requests with error handling."""
-        try:
-            async with self._session.post(
-                BASE_URL + endpoint,
-                headers=self._api_headers,  # NO PARENTHESES HERE
-                json=body
-            ) as resp:
-                self._check_session_expired(resp)
-                return await resp.json(content_type=None)
-        except aiohttp.ClientError as err:
-            raise CannotConnectError(str(err)) from err
+    async def async_get_aft(self) -> None:
+        """Public wrapper to refresh the Anti-Forgery Token."""
+        await self._async_refresh_csrf_from_aft()
 
-    async def _get_json(self, endpoint: str, params: dict | None = None) -> Any:
-        """Helper for GET requests."""
+    async def _async_refresh_csrf_from_aft(self) -> None:
+        """Internal helper to fetch fresh CSRF token."""
+        try:
+            async with self._session.get(BASE_URL + ENDPOINT_GET_AFT, headers=self._api_headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    token = data.get("data") if isinstance(data.get("data"), str) else data.get("token")
+                    if token:
+                        self._api_csrf_token = token
+        except Exception:
+            _LOGGER.debug("CSRF refresh skipped")
+
+    async def _async_check_device_token(self) -> None:
+        """Advanced state machine probe."""
+        try:
+            await self._session.get(BASE_URL + ENDPOINT_VERIFY_2FA_TOKEN, headers=self._api_headers)
+        except Exception:
+            pass
+
+    async def _async_get_send_methods(self) -> list[str]:
+        """Fetch MFA delivery options."""
+        payload = await self._get_json(ENDPOINT_INIT_AUTH, unwrap_data=False)
+        data = payload.get("data", payload)
+        if isinstance(data, list):
+            return data
+        return data.get("sendMethods", ["Email", "SMS"])
+
+    def _check_session_expired(self, resp: aiohttp.ClientResponse) -> None:
+        """Check for session expiry or WAF blocks."""
+        if resp.status in (401, 403, 555):
+            raise SessionExpiredError(f"Session invalidated (HTTP {resp.status})")
+        if "json" not in (resp.content_type or "").lower():
+            raise SessionExpiredError("Server returned non-JSON; possible redirect or block.")
+
+    async def _get_json(self, endpoint: str, params: dict | None = None, unwrap_data: bool = True) -> Any:
+        """GET helper with error handling."""
         try:
             async with self._session.get(
                 BASE_URL + endpoint,
-                headers=self._api_headers, # NO PARENTHESES HERE
+                headers=self._api_headers,
                 params=params
             ) as resp:
                 self._check_session_expired(resp)
-                return await resp.json(content_type=None)
-        except aiohttp.ClientError as err:
-            raise CannotConnectError(str(err)) from err
-
-    def _check_session_expired(self, resp: aiohttp.ClientResponse) -> None:
-        if resp.status in (401, 403, 555):
-            raise SessionExpiredError("Session expired")
-        if "json" not in (resp.content_type or "").lower():
-            raise SessionExpiredError("Non-JSON response (WAF block or redirect)")
-        content_type = resp.content_type or ""
-        if "json" not in content_type.lower():
-            # If the server sends HTML instead of JSON, we've likely been redirected to a login page
-            _LOGGER.warning("Non-JSON response received from %s", resp.url)
-            raise SessionExpiredError("Received non-JSON response; session likely expired or blocked.")
-
-    async def _get_json(self, endpoint: str, params: dict | None = None) -> Any:
-        """GET an API endpoint and return parsed JSON data field."""
-        try:
-            async with self._session.get(
-                BASE_URL + endpoint,
-                headers=self._api_headers,
-                params=params,
-                allow_redirects=True,
-            ) as resp:
-                self._check_session_expired(resp)
                 payload = await resp.json(content_type=None)
+                if unwrap_data:
+                    return payload.get("data", payload)
+                return payload
         except SessionExpiredError:
             raise
-        except aiohttp.ClientError as err:
+        except Exception as err:
             raise CannotConnectError(str(err)) from err
 
-        return_code = str(payload.get("returnCode", "0"))
-        if return_code != "0":
-            raise ApiError(
-                f"API {endpoint} returned code {return_code}: "
-                f"{payload.get('pageMessage')}"
-            )
-        return payload.get("data", payload)
-
-    async def _post_json(self, endpoint: str, body: dict) -> Any:
-        """POST JSON to an API endpoint and return parsed JSON."""
+    async def _post_json(self, endpoint: str, body: dict, unwrap_data: bool = True) -> Any:
+        """POST helper with error handling."""
         try:
             async with self._session.post(
                 BASE_URL + endpoint,
                 headers=self._api_headers,
-                json=body,
-                allow_redirects=True,
+                json=body
             ) as resp:
                 self._check_session_expired(resp)
                 payload = await resp.json(content_type=None)
+                if unwrap_data:
+                    return payload.get("data", payload)
+                return payload
         except SessionExpiredError:
             raise
-        except aiohttp.ClientError as err:
+        except Exception as err:
             raise CannotConnectError(str(err)) from err
 
-        return_code = str(payload.get("returnCode", "0"))
-        if return_code != "0":
-            raise ApiError(
-                f"API {endpoint} returned code {return_code}: "
-                f"{payload.get('pageMessage')}"
-            )
-        return payload.get("data", payload)
-
+    # Data Fetching Methods
     async def async_get_account_listing(self) -> dict:
-        """Return account listing (single or multi-account)."""
         return await self._get_json(ENDPOINT_LISTING)
 
     async def async_select_account(self, encrypted_number: str) -> bool:
-        """Select the active account for subsequent API calls."""
-        result = await self._post_json(
-            ENDPOINT_SELECT,
-            {"EncryptedAccountNumber": encrypted_number, "_df": ""},
-        )
-        return bool(result)
+        await self._post_json(ENDPOINT_SELECT, {"EncryptedAccountNumber": encrypted_number, "_df": ""})
+        return True
 
     async def async_get_account_summary(self) -> dict:
-        """Return account summary: balance, due date, last payment."""
         return await self._get_json(ENDPOINT_ACCOUNT_INIT)
 
     async def async_get_payment_widget(self) -> dict:
-        """Return numeric balance and due date from payment widget."""
         return await self._get_json(ENDPOINT_PAYMENT)
 
     async def async_get_energy_analyzer(self) -> dict:
-        """Return monthly usage/cost per utility (primary usage endpoint)."""
         return await self._get_json(ENDPOINT_ENERGY)
 
     async def async_get_all_usage_data(self) -> dict:
-        """Return per-bill line items, gas/electric split."""
         return await self._get_json(ENDPOINT_USAGE)
 
-    async def async_get_daily_usage(
-        self,
-        start: str = "1900-01-01",
-        end: str = "1900-01-01",
-        revenue_month: int = 0,
-    ) -> dict:
-        """Return daily kWh/CCF arrays for a billing period.
-
-        Use start='1900-01-01' and revenue_month=0 for the current period.
-        """
-        params = {
-            "startDate": start,
-            "endDate": end,
-            "electricStartDate": start,
-            "electricEndDate": end,
-            "gasStartDate": start,
-            "gasEndDate": end,
-            "revenueMonth": revenue_month,
-            "callType": "L",
-        }
+    async def async_get_daily_usage(self, start: str, end: str, revenue_month: int = 0) -> dict:
+        params = {"startDate": start, "endDate": end, "revenueMonth": revenue_month, "callType": "L"}
         return await self._get_json(ENDPOINT_DAILY, params=params)
