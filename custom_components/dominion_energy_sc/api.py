@@ -5,6 +5,7 @@ import logging
 import re
 from typing import Any
 
+import asyncio
 import aiohttp
 
 from .const import (
@@ -102,7 +103,9 @@ class DominionEnergySCClient:
 
         if mfa_required:
             await self._async_refresh_csrf_from_aft()
+            await asyncio.sleep(0.5)  # Wait for CSRF to settle
             await self._async_check_device_token()
+            await asyncio.sleep(0.5)  # Wait before asking for methods
             send_methods = await self._async_get_send_methods()
             raise OTPRequiredError(send_methods)
 
@@ -150,12 +153,28 @@ class DominionEnergySCClient:
             pass
 
     async def _async_get_send_methods(self) -> list[str]:
-        """Fetch MFA delivery options."""
-        payload = await self._get_json(ENDPOINT_INIT_AUTH, unwrap_data=False)
+        """Fetch MFA delivery options with a small delay to appease the WAF."""
+        await asyncio.sleep(1.2)  # Simulate human "thinking" time
+
+        # Override headers specifically for this sensitive call
+        headers = self._api_headers
+        headers["Referer"] = f"{BASE_URL}/access/login"
+
+        try:
+            async with self._session.get(
+                    BASE_URL + ENDPOINT_INIT_AUTH,
+                    headers=headers
+            ) as resp:
+                self._check_session_expired(resp)
+                payload = await resp.json(content_type=None)
+        except SessionExpiredError:
+            _LOGGER.warning("WAF blocked MFA method fetch (HTTP 555). Try again in a few minutes.")
+            raise
+
         data = payload.get("data", payload)
         if isinstance(data, list):
             return data
-        return data.get("sendMethods", ["Email", "SMS"])
+        return data.get("sendMethods", ["Email/SMS"])
 
     def _check_session_expired(self, resp: aiohttp.ClientResponse) -> None:
         """Check for session expiry or WAF blocks."""
