@@ -16,6 +16,7 @@ from .api import (
     DominionEnergySCClient,
     InvalidCredentialsError,
     OTPRequiredError,
+    SessionExpiredError,
 )
 from .const import BASE_URL, CONF_COOKIES, CONF_PASSWORD, CONF_USERNAME, DOMAIN
 
@@ -171,7 +172,7 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
         return await self.async_step_select_account()
 
     async def async_step_select_delivery(
-        self, user_input: dict[str, Any] | None = None
+            self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Let the user pick SMS/email delivery for MFA code."""
         errors: dict[str, str] = {}
@@ -181,9 +182,13 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
             assert self._client is not None
             try:
                 await self._client.async_send_pin(send_method)
+            except SessionExpiredError:
+                # Session died while user was on this screen
+                _LOGGER.warning("Session expired before PIN could be sent")
+                return await self.async_step_user()  # Send back to login
             except CannotConnectError:
                 errors["base"] = "cannot_connect"
-            except Exception:  # noqa: BLE001
+            except Exception:
                 _LOGGER.exception("Unexpected error sending PIN")
                 errors["base"] = "unknown"
             else:
@@ -199,7 +204,7 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_enter_otp(
-        self, user_input: dict[str, Any] | None = None
+            self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Prompt user for the 6-digit OTP code."""
         errors: dict[str, str] = {}
@@ -209,6 +214,14 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
             assert self._client is not None
             try:
                 await self._client.async_verify_pin(pin_code)
+            except SessionExpiredError:
+                _LOGGER.warning("Session expired during PIN verification")
+                # Return to login step with an error message
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=STEP_USER_DATA_SCHEMA,
+                    errors={"base": "session_expired"},
+                )
             except InvalidCredentialsError:
                 errors["base"] = "invalid_otp"
             except CannotConnectError as err:

@@ -61,6 +61,7 @@ class DominionEnergySCClient:
         self._api_csrf_token: str | None = None
 
     @property
+    @property
     def _api_headers(self) -> dict[str, str]:
         return {
             "__RequestVerificationToken": self._api_csrf_token or "",
@@ -70,6 +71,8 @@ class DominionEnergySCClient:
             "Origin": BASE_URL,
             "X-Requested-With": "XMLHttpRequest",
             "Referer": BASE_URL + "/",
+            # Add a realistic User-Agent to bypass WAF blocks
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         }
 
     async def async_setup_session(self) -> None:
@@ -330,25 +333,19 @@ class DominionEnergySCClient:
 
     async def async_send_pin(self, send_method: str) -> None:
         """Send OTP to the chosen delivery method."""
-        try:
-            async with self._session.post(
-                BASE_URL + ENDPOINT_SEND_PIN,
-                json={"sendMethod": send_method, "_df": ""},
-                headers=self._api_headers,
-                allow_redirects=True,
-            ) as resp:
-                text = await resp.text()
-                _LOGGER.debug("SendPINCode response (HTTP %s): %s", resp.status, text[:200])
-                if not text.strip():
-                    return  # empty body = accepted
-                payload = json.loads(text)
-        except aiohttp.ClientError as err:
-            raise CannotConnectError(str(err)) from err
+        # This uses your helper which handles headers and session checks automatically
+        payload = await self._post_json(
+            ENDPOINT_SEND_PIN,
+            {"sendMethod": send_method, "_df": ""}
+        )
 
-        if payload.get("success") is False or payload.get("status") is False:
-            raise CannotConnectError(
-                f"SendPINCode rejected: {payload.get('pageMessage') or payload}"
-            )
+        # Dominion often returns a simple boolean 'true' or a dict with 'status'
+        if isinstance(payload, dict):
+            if payload.get("success") is False or payload.get("status") is False:
+                raise ApiError(
+                    f"SendPINCode rejected: {payload.get('pageMessage') or 'Unknown error'}"
+                )
+        _LOGGER.debug("SendPINCode successful")
 
     async def async_verify_pin(self, pin_code: str) -> None:
         """Verify OTP and register device to skip MFA on subsequent logins.
@@ -413,14 +410,15 @@ class DominionEnergySCClient:
 
     def _check_session_expired(self, resp: aiohttp.ClientResponse) -> None:
         """Raise SessionExpiredError if response indicates session loss."""
+        # If we get a 401, 403, or 555, the session is definitely dead
+        if resp.status in (401, 403, 555):
+            raise SessionExpiredError(f"Session invalidated by server (HTTP {resp.status})")
+
         content_type = resp.content_type or ""
-        if "json" not in content_type:
-            raise SessionExpiredError(
-                f"Expected JSON but got content-type: {content_type}"
-            )
-        final_url = str(resp.url)
-        if ENDPOINT_AUTH.rstrip("/") in final_url:
-            raise SessionExpiredError("API call redirected to login endpoint")
+        if "json" not in content_type.lower():
+            # If the server sends HTML instead of JSON, we've likely been redirected to a login page
+            _LOGGER.warning("Non-JSON response received from %s", resp.url)
+            raise SessionExpiredError("Received non-JSON response; session likely expired or blocked.")
 
     async def _get_json(self, endpoint: str, params: dict | None = None) -> Any:
         """GET an API endpoint and return parsed JSON data field."""
