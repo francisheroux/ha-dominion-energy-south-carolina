@@ -39,7 +39,7 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
         self._username: str = ""
         self._password: str = ""
         self._accounts: list[dict] = []
-        self._send_methods: list[str] = []
+        self._send_methods: list[dict] = []
         self._client: DominionEnergySCClient | None = None
         self._session: aiohttp.ClientSession | None = None
         self._is_reauth: bool = False
@@ -178,11 +178,15 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
         """Let the user pick SMS/email delivery for MFA code."""
         errors: dict[str, str] = {}
 
+        # Build a description→type lookup so we can show masked labels but send the API type
+        desc_to_type = {m["description"]: m["type"] for m in self._send_methods}
+
         if user_input is not None:
-            send_method = user_input["send_method"]
+            selected_desc = user_input["send_method"]
+            send_type = desc_to_type.get(selected_desc, selected_desc)
             assert self._client is not None
             try:
-                await self._client.async_send_pin(send_method)
+                await self._client.async_send_pin(send_type)
             except SessionExpiredError:
                 # Session died while user was on this screen
                 _LOGGER.warning("Session expired before PIN could be sent")
@@ -195,7 +199,7 @@ class DominionEnergySCConfigFlow(ConfigFlow, domain=DOMAIN):
             else:
                 return await self.async_step_enter_otp()
 
-        method_options = {m: m for m in self._send_methods}
+        method_options = {m["description"]: m["description"] for m in self._send_methods}
         return self.async_show_form(
             step_id="select_delivery",
             data_schema=vol.Schema(

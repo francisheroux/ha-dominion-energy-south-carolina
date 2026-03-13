@@ -42,7 +42,7 @@ class ApiError(Exception):
 
 class OTPRequiredError(Exception):
     """MFA required."""
-    def __init__(self, send_methods: list[str]) -> None:
+    def __init__(self, send_methods: list[dict]) -> None:
         self.send_methods = send_methods
         super().__init__(f"OTP required; methods: {send_methods}")
 
@@ -115,8 +115,21 @@ class DominionEnergySCClient:
         await self.async_get_aft()
 
     async def async_send_pin(self, send_method: str) -> None:
-        """Send the MFA PIN."""
-        await self._post_json(ENDPOINT_SEND_PIN, {"sendMethod": send_method, "_df": ""})
+        """Send the MFA PIN via a lenient POST (sendPIN may return non-JSON on success)."""
+        try:
+            async with self._session.post(
+                BASE_URL + ENDPOINT_SEND_PIN,
+                headers=self._api_headers,
+                json={"sendMethod": send_method, "_df": ""},
+                allow_redirects=True,
+            ) as resp:
+                if resp.status in (401, 403, 555):
+                    raise SessionExpiredError(f"Session invalidated (HTTP {resp.status})")
+                # sendPIN may return non-JSON on success — do not check content-type
+        except SessionExpiredError:
+            raise
+        except aiohttp.ClientError as err:
+            raise CannotConnectError(str(err)) from err
 
     async def async_verify_pin(self, pin_code: str) -> None:
         """Verify the MFA PIN."""
@@ -152,8 +165,8 @@ class DominionEnergySCClient:
         except Exception:
             pass
 
-    async def _async_get_send_methods(self) -> list[str]:
-        """Fetch MFA delivery options and extract the masked descriptions."""
+    async def _async_get_send_methods(self) -> list[dict]:
+        """Fetch MFA delivery options and return type+description dicts."""
         await asyncio.sleep(1.2)  # Simulate human "thinking" time
 
         # Override headers specifically for this sensitive call
@@ -176,13 +189,19 @@ class DominionEnergySCClient:
         data = payload.get("data", [])
 
         if isinstance(data, list) and len(data) > 0:
-            # Extract only the 'description' strings for the UI
-            methods = [item.get("description") for item in data if item.get("description")]
+            methods = [
+                {"type": item["type"], "description": item.get("description", item["type"])}
+                for item in data
+                if item.get("type")
+            ]
             if methods:
                 return methods
 
         # Fallback if the data structure is unexpected
-        return ["Email", "SMS"]
+        return [
+            {"type": "Email", "description": "Email"},
+            {"type": "SMS", "description": "SMS"},
+        ]
 
     def _check_session_expired(self, resp: aiohttp.ClientResponse) -> None:
         """Check for session expiry or WAF blocks."""
